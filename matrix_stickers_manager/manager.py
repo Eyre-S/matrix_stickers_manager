@@ -1,3 +1,4 @@
+from time import sleep
 import urllib
 from dataclasses import dataclass
 import requests
@@ -49,38 +50,44 @@ class MatrixStickersManager:
         Just upload media file to matrix storage and return mxc url.
         https://matrix.org/docs/api/#post-/_matrix/media/v3/upload
         """
-
+        
         if not os.path.exists(file_path):
             raise MatrixStickersManagerError(text=f'File {file_path} doest exist.')
-
+        
         if os.path.getsize(file_path) > self._config.max_media_upload_size:
             raise MatrixStickersManagerError(text=f'File is so large. '
                                                   f'Max upload size is {self._config.max_media_upload_size}bytes.')
-
+        
         filename = os.path.basename(file_path)
         filemime = filetype.guess(file_path)
-
+        
         if filemime is not None:
             filemime = filemime.mime
         else:
             raise MatrixStickersManagerError(text='Unknown file type.')
-
+        
         if image_type_only:
             if filemime not in ('image/png', 'image/jpeg', 'image/gif', 'image/webp'):
                 raise MatrixStickersManagerError(text='Invalid media file format.')
-
-        with open(file_path, 'rb') as file:
-            response = requests.post(f'https://{self._config.matrix_domain}/_matrix/media/v3/upload'
-                                     f'?filename={filename}'
-                                     f'&access_token={self._config.matrix_token}',
-                                     headers={
-                                         'Content-Type': filemime
-                                     }, data=file)
-
-            if response.status_code != 200:
-                raise MatrixStickersManagerError(text=response.text)
-            else:
-                return response.json()['content_uri']
+        
+        err: MatrixStickersManagerError = MatrixStickersManagerError("unknown error on uploading")
+        for i in range(0, 3):
+            if i != 0:
+                print ("retrying...")
+                sleep(3.0)
+            with open(file_path, 'rb') as file:
+                response = requests.post(f'https://{self._config.matrix_domain}/_matrix/media/v3/upload'
+                                         f'?filename={filename}'
+                                         f'&access_token={self._config.matrix_token}',
+                                         headers={
+                                             'Content-Type': filemime
+                                         }, data=file)
+                if response.status_code != 200:
+                    err = MatrixStickersManagerError(text=response.text)
+                    print ("failed uploading media: " + err.text)
+                else:
+                    return response.json()['content_uri']
+        raise err
 
     def _get_room_state(self, pack_name: str, room_id: str) -> dict:
         """
@@ -128,13 +135,20 @@ class MatrixStickersManager:
         """
         Update pack with his name.
         """
-
-        response = requests.put(f'https://{self._config.matrix_domain}/_matrix/client/v3/rooms/{room_id}'
-                                f'/state/im.ponies.room_emotes/{name}'
-                                f'?access_token={self._config.matrix_token}', json=pack)
-
-        if response.status_code != 200:
-            raise MatrixStickersManagerError(text=response.text)
+        err: MatrixStickersManagerError = MatrixStickersManagerError("unknown error")
+        for i in range(0, 4):
+            if i != 0:
+                print ("retrying...")
+                sleep(3.0)
+            response = requests.put(f'https://{self._config.matrix_domain}/_matrix/client/v3/rooms/{room_id}'
+                                    f'/state/im.ponies.room_emotes/{name}'
+                                    f'?access_token={self._config.matrix_token}', json=pack)
+            if response.status_code != 200:
+                err = MatrixStickersManagerError(text=response.text)
+                print ("failed push pack: " + err.text)
+            else:
+                return
+        raise err
 
     @staticmethod
     def _add_sticker_to_pack(pack: dict, shortcode: str, image_mxc: str, usage: str | None = None):
@@ -142,13 +156,13 @@ class MatrixStickersManager:
         Add sticker to pack.
         https://github.com/Sorunome/matrix-doc/blob/soru/emotes/proposals/2545-emotes.md#example-image-pack-event
         Usage can be "sticker" or "emoticon" else both.
-
+        
         If shortcode already exist raise error.
         """
-
+        
         if pack['images'].get(shortcode, False):
             raise MatrixStickersManagerError(f'This shortcode "{shortcode}" already exist.')
-
+        
         if usage is not None:
             pack['images'][shortcode] = {
                 'url': image_mxc,
@@ -158,6 +172,7 @@ class MatrixStickersManager:
             pack['images'][shortcode] = {
                 'url': image_mxc
             }
+        
 
     def delete_pack(self, pack_name: str, room_id: str) -> None:
         """
@@ -190,42 +205,70 @@ class MatrixStickersManager:
         """
         Load all images from folder to pack.
         """
-
+        
+        print (f"Syncing pack data \"{pack_name}\" in room[{room_id}]")
         image_pack: dict = self._make_pack_obj(name=pack_name, room_id=room_id)
         all_files: list = []
-
+        
         for file_path in os.listdir(folder_path):
             if os.path.isfile(os.path.join(folder_path, file_path)):
                 all_files.append(file_path)
-
-        count: int = 1
+        
+        print ("uploading images...")
+        count: int = 0
+        count_succeed: int = 0
+        count_dumplicated: int = 0
+        total: int = all_files.__len__()
+        usage_readable: str = "sticker/emoticon" if usage == None else usage
         for file_path in all_files:
             # Upload image
+            
+            count += 1
+            file_id: str = os.path.splitext(file_path)[0]
+            shortcode: str = f"{count}" if number_as_shortcode else file_id
+            if number_as_shortcode:
+                print (f"uploading {usage_readable} :{shortcode}: using file {file_path} ({count}/{total})")
+            else:
+                print (f"uploading {usage_readable} :{shortcode}: ({count}/{total})(file {file_path})")
+            
+            if image_pack['images'].get(shortcode, False):
+                if skip_duplicate_errors:
+                    print (f"[warn] sticker with shortcode {shortcode} already exists.")
+                    count_dumplicated += 1
+                    continue
+                else:
+                    print (f"[ERROR] sticker with shortcode {shortcode} already exists.")
+                    raise MatrixStickersManagerError(f'This shortcode "{shortcode}" already exist.')
+            
             try:
                 image_url: str = self._upload_media(os.path.join(folder_path, file_path))
                 if self._config.is_server_admin and protect_media:
                     self._protect_media(image_url)
-
             except MatrixStickersManagerError as e:
                 if skip_upload_errors:
+                    count_dumplicated += 1
+                    print ("[WARN] cannot upload image: " + e.text)
                     continue
                 else:
                     raise e
-
+            
             try:
                 self._add_sticker_to_pack(pack=image_pack,
-                                          shortcode=count if number_as_shortcode else os.path.splitext(file_path)[0],
+                                          shortcode=shortcode,
                                           image_mxc=image_url, usage=usage)
             except MatrixStickersManagerError as e:
-                if skip_duplicate_errors:
-                    continue
-                else:
-                    raise e
-
-            self._push_pack(name=pack_name, room_id=room_id, pack=image_pack)
-
-            count += 1
-
+                raise e
+            
+            count_succeed += 1
+            
+        
+        print (f"Updating pack data \"{pack_name}\" for room [{room_id}]")
+        self._push_pack(name=pack_name, room_id=room_id, pack=image_pack)
+        
+        count_error: int = total - count_succeed - count_dumplicated
+        print (f"done upload pack {pack_name}: {count_succeed}/{total} succeed { f'{count_dumplicated} dumplicated' if count_dumplicated != 0 else '' } { f'{count_error} failed' if count_error != 0 else '' }")
+        
+    
     def _is_server_admin(self, user_id: str | None = None) -> bool:
         """
         Check is user be admin in server.
